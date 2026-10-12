@@ -375,6 +375,7 @@ static void testWideSpaceVariant() {
 }
 
 static void testNegatives() {
+    g_rng = 0xDEADBEEFu;
     Image img;
     img.width = 640;
     img.height = 128;

@@ -975,11 +975,13 @@ Result decodeCore(const uint8_t* y, int width, int height, int rowStride,
         bool ok = false;
         scanner.extract(line, count, step);
         if (!scanner.empty()) {
-            ok = scanner.decodeForward(options, text, moduleWidth);
+            ok = scanner.decodeForward(options, text, moduleWidth, true,
+                                       options.keepLongestReads);
             if (!ok) {
                 scanner.reverse();
                 reversed = true;
-                ok = scanner.decodeForward(options, text, moduleWidth);
+                ok = scanner.decodeForward(options, text, moduleWidth, true,
+                                           options.keepLongestReads);
             }
         }
         if (!ok && templateAttempts < kTemplateBudgetTotal) {
@@ -1391,6 +1393,10 @@ int beamModuleCandidates(const std::vector<Run>& runs, float* out, int cap) {
     return count;
 }
 
+bool isStrongResult(const Result& r, ChecksumMode mode) {
+    return r.found && r.votes >= 3 && analyzeChecksum(r.text, mode).strength >= 2;
+}
+
 bool betterIsolated(const Result& isolated, const Result& pooled, ChecksumMode mode) {
     if (isolated.found && isolated.votes < 2) {
         return false;
@@ -1408,7 +1414,10 @@ bool betterIsolated(const Result& isolated, const Result& pooled, ChecksumMode m
     if (isolatedStrength != pooledStrength) {
         return isolatedStrength > pooledStrength;
     }
-    return isolated.votes > pooled.votes;
+    if (isolated.votes != pooled.votes) {
+        return isolated.votes > pooled.votes;
+    }
+    return isolated.text.size() >= pooled.text.size();
 }
 
 Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
@@ -1418,8 +1427,9 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
     }
 
     Result result = decodeCore(y, width, height, rowStride, mode, options);
-    if (!result.found || result.votes < 3 ||
-        analyzeChecksum(result.text, mode).strength < 2) {
+    const bool autoMode = mode == ChecksumMode::Auto;
+    const bool weakFlow = autoMode ? !isStrongResult(result, mode) : !result.found;
+    if (weakFlow) {
         Band bands[kMaxBands];
         const int bandCount = findBands(y, width, height, rowStride, bands, kMaxBands);
         const int attempts = std::min(bandCount, 3);
@@ -1438,7 +1448,7 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
             }
             const Result isolated = decodeCore(crop.data(), width, cropHeight, width,
                                                mode, options);
-            if (betterIsolated(isolated, result, mode)) {
+            if (isolated.text.size() >= 6 && betterIsolated(isolated, result, mode)) {
                 result = isolated;
             }
             if (result.found && result.votes >= 3 &&
@@ -1451,7 +1461,8 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
         return result;
     }
 
-    if (options.upscaleRetry && std::max(width, height) < kUpscaleMaxLongEdge) {
+    if (options.upscaleRetry && weakFlow &&
+        std::max(width, height) < kUpscaleMaxLongEdge) {
         const int w2 = width * 2;
         const int h2 = height * 2;
         std::vector<uint8_t> up(static_cast<size_t>(w2) * h2);
@@ -1469,12 +1480,9 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
         if (retry.found && betterIsolated(retry, result, mode)) {
             result = retry;
         }
-        if (result.found) {
-            return result;
-        }
     }
 
-    if (options.contrastRetry) {
+    if (options.contrastRetry && weakFlow) {
         uint8_t mn = 255;
         uint8_t mx = 0;
         for (int row = 0; row < height; row += 4) {
@@ -1507,7 +1515,11 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
         }
     }
 
-    if (!result.found && options.beamRetry) {
+    const bool weakForRescue = autoMode
+        ? (!result.found || result.votes < 3 ||
+           analyzeChecksum(result.text, mode).strength < 2)
+        : !result.found;
+    if (options.beamRetry && weakForRescue) {
         std::vector<std::pair<std::string, int>> beamVotes;
         LineScanner beamScanner;
         std::vector<float> rescueProfile;
@@ -1638,19 +1650,247 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
                 }
             }
         }
+        const size_t phaseAEnd = beamVotes.size();
+        {
+            std::vector<int> darkRow(height, 0);
+            int maxDark = 0;
+            for (int r = 0; r < height; ++r) {
+                const uint8_t* row = y + static_cast<size_t>(r) * rowStride;
+                int count = 0;
+                for (int x = 0; x < width; ++x) {
+                    if (row[x] < 140) {
+                        ++count;
+                    }
+                }
+                darkRow[r] = count;
+                maxDark = std::max(maxDark, count);
+            }
+            if (maxDark >= 20) {
+                int rowThreshold = maxDark / 4;
+                if (rowThreshold > 80) {
+                    rowThreshold = 80;
+                }
+                if (rowThreshold < 12) {
+                    rowThreshold = 12;
+                }
+                struct DarkBand {
+                    int y0;
+                    int y1;
+                    int peak;
+                };
+                DarkBand bands[8];
+                int bandCount = 0;
+                int runStart = -1;
+                int runPeak = 0;
+                for (int r = 0; r <= height; ++r) {
+                    const bool dense = r < height && darkRow[r] >= rowThreshold;
+                    if (dense && runStart < 0) {
+                        runStart = r;
+                        runPeak = 0;
+                    }
+                    if (dense) {
+                        runPeak = std::max(runPeak, darkRow[r]);
+                    }
+                    if (!dense && runStart >= 0) {
+                        if (r - runStart >= 8 && bandCount < 8) {
+                            bands[bandCount].y0 = runStart;
+                            bands[bandCount].y1 = r;
+                            bands[bandCount].peak = runPeak;
+                            ++bandCount;
+                        }
+                        runStart = -1;
+                    }
+                }
+                for (int i = 0; i < bandCount; ++i) {
+                    for (int j = i + 1; j < bandCount; ++j) {
+                        if (bands[j].peak > bands[i].peak) {
+                            std::swap(bands[i], bands[j]);
+                        }
+                    }
+                }
+                const int bandTries = std::min(bandCount, 4);
+                for (int bi = 0; bi < bandTries; ++bi) {
+                    const int bestY0 = bands[bi].y0;
+                    const int bestY1 = bands[bi].y1;
+                    const int bandH = bestY1 - bestY0;
+                    if (g_debug) {
+                        std::fprintf(stderr, "[msi] dark band y=%d..%d peak=%d\n",
+                                     bestY0, bestY1, bands[bi].peak);
+                    }
+                    std::vector<int> colDark(width, 0);
+                    for (int r = bestY0; r < bestY1; ++r) {
+                        const uint8_t* row = y + static_cast<size_t>(r) * rowStride;
+                        for (int x = 0; x < width; ++x) {
+                            if (row[x] < 140) {
+                                ++colDark[x];
+                            }
+                        }
+                    }
+                    const int colNeed = std::max(2, bandH / 3);
+                    int x0 = 0;
+                    int x1 = width - 1;
+                    while (x0 < width && colDark[x0] < colNeed) {
+                        ++x0;
+                    }
+                    while (x1 > x0 && colDark[x1] < colNeed) {
+                        --x1;
+                    }
+                    if (x1 - x0 < 60) {
+                        continue;
+                    }
+                    for (int expand = 8; expand <= 24; expand += 8) {
+                        const int cy0 = std::max(0, bestY0 - expand);
+                        const int cy1 = std::min(height, bestY1 + expand);
+                        const int cx0 = std::max(0, x0 - expand);
+                        const int cx1 = std::min(width, x1 + expand + 1);
+                        const int cw = cx1 - cx0;
+                        const int ch = cy1 - cy0;
+                        if (cw < 60 || ch < 10) {
+                            continue;
+                        }
+                        std::vector<uint8_t> crop(static_cast<size_t>(cw) * ch);
+                        for (int r = 0; r < ch; ++r) {
+                            std::memcpy(crop.data() + static_cast<size_t>(r) * cw,
+                                        y + static_cast<size_t>(cy0 + r) * rowStride + cx0,
+                                        cw);
+                        }
+                        Options cropOptions = options;
+                        cropOptions.keepLongestReads = true;
+                        cropOptions.upscaleRetry = true;
+                        cropOptions.contrastRetry = true;
+                        cropOptions.beamRetry = false;
+                        const Result cr = decodeCore(crop.data(), cw, ch, cw, mode,
+                                                     cropOptions);
+                        if (cr.found && !isUniform(cr.text)) {
+                            if (g_debug) {
+                                std::fprintf(stderr,
+                                             "[msi] dark crop band=%d exp=%d -> %s votes=%d\n",
+                                             bi, expand, cr.text.c_str(), cr.votes);
+                            }
+                            bool merged = false;
+                            for (auto& vote : beamVotes) {
+                                if (vote.first == cr.text) {
+                                    vote.second += 1;
+                                    merged = true;
+                                    break;
+                                }
+                            }
+                            if (!merged) {
+                                beamVotes.push_back({cr.text, 1});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        {
+            std::vector<uint8_t> strip;
+            LineScanner probe;
+            int stripDecodes = 0;
+            int stripCalls = 0;
+            const int sizes[5] = {170, 140, std::max(120, width / 3),
+                                  std::max(120, width / 2), std::max(120, (width * 2) / 3)};
+            const int stripH = 14;
+            for (int y0 = 0; y0 + stripH <= height && stripDecodes < 400 && stripCalls < 1500;
+                 y0 += 4) {
+                const int probeRow = y0 + stripH / 2;
+                for (int szi = 0; szi < 5; ++szi) {
+                    const int sz = sizes[szi];
+                    if (sz > width) {
+                        continue;
+                    }
+                    const int xstep = std::max(6, sz / 16);
+                    for (int x0 = 0; x0 + sz <= width; x0 += xstep) {
+                        if (stripCalls >= 1500) {
+                            break;
+                        }
+                        probe.extract(y + static_cast<size_t>(probeRow) * rowStride + x0, sz, 1);
+                        const size_t probeRuns = probe.runs().size();
+                        if (probeRuns < 20 || probeRuns > 200) {
+                            continue;
+                        }
+                        ++stripCalls;
+                        strip.resize(static_cast<size_t>(sz) * stripH);
+                        for (int r = 0; r < stripH; ++r) {
+                            std::memcpy(strip.data() + static_cast<size_t>(r) * sz,
+                                        y + static_cast<size_t>(y0 + r) * rowStride + x0, sz);
+                        }
+                        Options stripOptions = options;
+                        stripOptions.keepLongestReads = true;
+                        stripOptions.upscaleRetry = false;
+                        stripOptions.contrastRetry = false;
+                        stripOptions.beamRetry = false;
+                        const Result sr = decodeCore(strip.data(), sz, stripH, sz, mode,
+                                                     stripOptions);
+                        if (sr.found && !isUniform(sr.text)) {
+                            ++stripDecodes;
+                            bool merged = false;
+                            for (auto& vote : beamVotes) {
+                                if (vote.first == sr.text) {
+                                    vote.second += 1;
+                                    merged = true;
+                                    break;
+                                }
+                            }
+                            if (!merged) {
+                                beamVotes.push_back({sr.text, 1});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        auto pickWinner = [&](size_t begin, size_t end, int minVotes, int minLength,
+                              std::string& outText, int& outVotes) {
+            std::vector<std::pair<std::string, int>> pool(beamVotes.begin() + begin,
+                                                          beamVotes.begin() + end);
+            auto stripped = [](const std::string& text) {
+                size_t i = 0;
+                while (i + 1 < text.size() && text[i] == '0') {
+                    ++i;
+                }
+                return text.substr(i);
+            };
+            std::vector<std::pair<std::string, int>> merged;
+            for (const auto& vote : pool) {
+                const std::string key = stripped(vote.first);
+                bool found = false;
+                for (auto& m : merged) {
+                    if (stripped(m.first) != key) {
+                        continue;
+                    }
+                    m.second += vote.second;
+                    if (vote.first.size() > m.first.size()) {
+                        m.first = vote.first;
+                    }
+                    found = true;
+                    break;
+                }
+                if (!found) {
+                    merged.push_back(vote);
+                }
+            }
+            outText.clear();
+            outVotes = 0;
+            for (const auto& vote : merged) {
+                const ChecksumInfo info = analyzeChecksum(vote.first, mode);
+                if (info.status != ChecksumStatus::Valid) {
+                    continue;
+                }
+                if (vote.second >= minVotes &&
+                    static_cast<int>(vote.first.size()) >= minLength &&
+                    (vote.second > outVotes ||
+                     (vote.second == outVotes && vote.first.size() > outText.size()))) {
+                    outText = vote.first;
+                    outVotes = vote.second;
+                }
+            }
+        };
         std::string bestText;
         int bestVotes = 0;
-        for (const auto& vote : beamVotes) {
-            const ChecksumInfo info = analyzeChecksum(vote.first, mode);
-            if (info.status != ChecksumStatus::Valid) {
-                continue;
-            }
-            const bool acceptable = vote.second >= 2;
-            if (acceptable && (vote.second > bestVotes ||
-                (vote.second == bestVotes && vote.first.size() > bestText.size()))) {
-                bestText = vote.first;
-                bestVotes = vote.second;
-            }
+        pickWinner(0, phaseAEnd, 4, 1, bestText, bestVotes);
+        if (bestText.empty()) {
+            pickWinner(phaseAEnd, beamVotes.size(), 4, 7, bestText, bestVotes);
         }
         if (!bestText.empty()) {
             Result beamResult;
@@ -1660,10 +1900,15 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
             beamResult.checksum = analyzeChecksum(bestText, mode).status;
             beamResult.scheme = analyzeChecksum(bestText, mode).scheme;
             if (g_debug) {
-                std::fprintf(stderr, "[msi] beam winner=%s votes=%d\n",
+                std::fprintf(stderr, "[msi] rescue winner=%s votes=%d\n",
                              bestText.c_str(), bestVotes);
             }
-            result = beamResult;
+            const bool better = !result.found ||
+                (betterIsolated(beamResult, result, mode) &&
+                 beamResult.votes >= result.votes + 3);
+            if (better) {
+                result = beamResult;
+            }
         }
     }
 

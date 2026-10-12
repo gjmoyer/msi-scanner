@@ -32,6 +32,7 @@ struct Options {
     bool upscaleRetry = true;
     bool contrastRetry = true;
     bool beamRetry = true;
+    bool keepLongestReads = false;
 };
 
 struct Result {
