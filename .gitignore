@@ -1,0 +1,15 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+.cxx/
+captures/
+*.apk
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.heic
+results*.tsv
