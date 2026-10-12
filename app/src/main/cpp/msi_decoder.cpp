@@ -20,7 +20,7 @@ constexpr float kWidthTolerance = 0.45f;
 constexpr float kQuietFactor = 3.8f;
 constexpr float kMinModuleWidth = 0.9f;
 constexpr int kMinContrast = 24;
-constexpr int kMaxCandidateTries = 64;
+constexpr int kMaxCandidateTries = 256;
 constexpr int kMaxRuns = 4096;
 constexpr int kMaxRepairs = 2;
 constexpr int kMaxBands = 8;
@@ -101,15 +101,20 @@ public:
 
     bool empty() const { return runs_.empty(); }
 
+    bool repairsEnabled = true;
+
     std::vector<Run>& runs() { return runs_; }
 
     void reverse() {
         std::reverse(runs_.begin(), runs_.end());
     }
 
-    bool decodeForward(const Options& opts, std::string& text, float& moduleWidth) {
+    bool decodeForward(const Options& opts, std::string& text, float& moduleWidth,
+                       bool requireQuietBefore = true, bool keepLongest = false) {
         const int n = static_cast<int>(runs_.size());
         int tries = 0;
+        std::string bestText;
+        float bestModule = 0.0f;
         for (int i = 0; i + 2 < n; ++i) {
             if (!runs_[i].black) {
                 continue;
@@ -126,24 +131,36 @@ public:
             if (s0 < 0.6f * m || s0 > 2.6f * m) {
                 continue;
             }
-            const bool quietBefore = (i == 0) ||
-                (!runs_[i - 1].black && runs_[i - 1].len >= kQuietFactor * m);
-            if (!quietBefore) {
-                continue;
+            if (requireQuietBefore) {
+                const bool quietBefore = (i == 0) ||
+                    (!runs_[i - 1].black && runs_[i - 1].len >= kQuietFactor * m);
+                if (!quietBefore) {
+                    continue;
+                }
             }
             if (++tries > kMaxCandidateTries) {
                 break;
             }
             std::string digits;
             if (decodeFromForward(i + 2, m, opts, digits)) {
-                text = std::move(digits);
-                moduleWidth = m;
-                return true;
-            }
-            if (g_debug >= 2) {
+                if (!keepLongest) {
+                    text = std::move(digits);
+                    moduleWidth = m;
+                    return true;
+                }
+                if (digits.size() > bestText.size()) {
+                    bestText = std::move(digits);
+                    bestModule = m;
+                }
+            } else if (g_debug >= 2) {
                 std::fprintf(stderr, "[msi] cand i=%d b0=%.1f s0=%.1f m=%.2f rejected\n",
                              i, b0, s0, m);
             }
+        }
+        if (keepLongest && !bestText.empty()) {
+            text = std::move(bestText);
+            moduleWidth = bestModule;
+            return true;
         }
         return false;
     }
@@ -200,7 +217,7 @@ private:
                 bar.len <= 2.8f * m &&
                 space.len >= 0.5f * m && space.len <= 3.4f * m &&
                 sum >= 2.6f * m && sum <= 4.4f * m;
-            if (!valid && repairs < kMaxRepairs && bar.black && !space.black &&
+            if (!valid && repairsEnabled && repairs < kMaxRepairs && bar.black && !space.black &&
                 k + 2 < n && seg[k + 2].black && space.len < 0.6f * m) {
                 const float merged = seg[k].len + seg[k + 1].len + seg[k + 2].len;
                 seg.erase(seg.begin() + k + 1, seg.begin() + k + 3);
@@ -1495,22 +1512,84 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
         LineScanner beamScanner;
         std::vector<float> rescueProfile;
         int rescueTemplateAttempts = 0;
+        std::vector<uint8_t> binar(width);
+        std::vector<uint8_t> localRow(width);
         {
-            const int step = std::max(5, height / 24);
+            const int step = 2;
             int rows = 0;
-            for (int yy = step / 2; yy < height - 1 && rows < 24; yy += step, ++rows) {
-                beamScanner.extract(y + static_cast<size_t>(yy) * rowStride, width, 1);
-                const std::vector<Run>& lineRuns = beamScanner.runs();
-                if (g_debug) {
-                    std::fprintf(stderr, "[msi] beam row=%d runs=%zu\n", yy, lineRuns.size());
+            int beamAttempts = 0;
+            for (int yy = 1; yy < height - 1 && rows < 360; yy += step, ++rows) {
+                const uint8_t* line = y + static_cast<size_t>(yy) * rowStride;
+                const int half = 28;
+                for (int x = 0; x < width; ++x) {
+                    const int a = std::max(0, x - half);
+                    const int b = std::min(width, x + half + 1);
+                    uint8_t mn = 255;
+                    uint8_t mx = 0;
+                    for (int q = a; q < b; ++q) {
+                        mn = std::min(mn, line[q]);
+                        mx = std::max(mx, line[q]);
+                    }
+                    localRow[x] = line[x] <= (mn + mx) / 2 ? 0 : 255;
                 }
-                if (rescueTemplateAttempts < 20 && lineRuns.size() >= 8) {
+                beamScanner.extract(localRow.data(), width, 1);
+                if (beamScanner.runs().size() > 200) {
+                    continue;
+                }
+                const size_t lineRunsDebug = beamScanner.runs().size();
+                beamScanner.repairsEnabled = false;
+                {
+                    std::string runText;
+                    float runModule = 0.0f;
+                    const bool runOk = beamScanner.decodeForward(options, runText, runModule,
+                                                                false, true);
+                    if (g_debug) {
+                        std::fprintf(stderr, "[msi] rescue row=%d runs=%zu run=%s\n",
+                                     yy, lineRunsDebug, runOk ? runText.c_str() : "miss");
+                    }
+                    if (runOk) {
+                        if (!isUniform(runText)) {
+                            bool merged = false;
+                            for (auto& vote : beamVotes) {
+                                if (vote.first == runText) {
+                                    vote.second += 1;
+                                    merged = true;
+                                    break;
+                                }
+                            }
+                            if (!merged) {
+                                beamVotes.push_back({runText, 1});
+                            }
+                        }
+                    } else {
+                        beamScanner.reverse();
+                        if (beamScanner.decodeForward(options, runText, runModule,
+                                                      false, true)) {
+                            if (!isUniform(runText)) {
+                                bool merged = false;
+                                for (auto& vote : beamVotes) {
+                                    if (vote.first == runText) {
+                                        vote.second += 1;
+                                        merged = true;
+                                        break;
+                                    }
+                                }
+                                if (!merged) {
+                                    beamVotes.push_back({runText, 1});
+                                }
+                            }
+                        }
+                        beamScanner.reverse();
+                    }
+                }
+                beamScanner.repairsEnabled = true;
+                const std::vector<Run>& lineRuns = beamScanner.runs();
+                if (rescueTemplateAttempts < 120 && yy % 6 < 2 && lineRuns.size() >= 8) {
                     ++rescueTemplateAttempts;
                     float rescueScore = 0.0f;
                     float rescueModule = 0.0f;
                     std::string rescueDigits;
-                    extractProfile(y + static_cast<size_t>(yy) * rowStride, width, 1,
-                                   rescueProfile);
+                    extractProfile(line, width, 1, rescueProfile);
                     if (decodeProfileByTemplates(rescueProfile.data(),
                                                  static_cast<int>(rescueProfile.size()),
                                                  options, mode, rescueDigits,
@@ -1534,21 +1613,14 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
                 }
                 float moduleCandidates[4];
                 const int moduleCount = beamModuleCandidates(lineRuns, moduleCandidates, 4);
-                if (g_debug) {
-                    for (int q = 0; q < moduleCount; ++q) {
-                        std::fprintf(stderr, "[msi]   m=%.2f\n", moduleCandidates[q]);
-                    }
-                }
-                for (int mi = 0; mi < moduleCount; ++mi) {
-                    for (int variant = 0; variant < 2; ++variant) {
+                for (int mi = 0; mi < moduleCount && beamAttempts < 64; ++mi) {
+                    for (int variant = 0; variant < 2 && beamAttempts < 64; ++variant) {
+                        ++beamAttempts;
                         std::string digits;
                         if (beamDecodeRuns(lineRuns, moduleCandidates[mi], variant == 1,
                                            mode, options, digits)) {
                             if (isUniform(digits)) {
                                 continue;
-                            }
-                            if (g_debug) {
-                                std::fprintf(stderr, "[msi]   beam hit %s\n", digits.c_str());
                             }
                             bool merged = false;
                             for (auto& vote : beamVotes) {
