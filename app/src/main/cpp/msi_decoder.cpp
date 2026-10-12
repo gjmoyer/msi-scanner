@@ -1493,14 +1493,41 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
     if (!result.found && options.beamRetry) {
         std::vector<std::pair<std::string, int>> beamVotes;
         LineScanner beamScanner;
+        std::vector<float> rescueProfile;
+        int rescueTemplateAttempts = 0;
         {
-            const int step = std::max(6, height / 14);
+            const int step = std::max(5, height / 24);
             int rows = 0;
-            for (int yy = step / 2; yy < height - 1 && rows < 14; yy += step, ++rows) {
+            for (int yy = step / 2; yy < height - 1 && rows < 24; yy += step, ++rows) {
                 beamScanner.extract(y + static_cast<size_t>(yy) * rowStride, width, 1);
                 const std::vector<Run>& lineRuns = beamScanner.runs();
                 if (g_debug) {
                     std::fprintf(stderr, "[msi] beam row=%d runs=%zu\n", yy, lineRuns.size());
+                }
+                if (rescueTemplateAttempts < 20 && lineRuns.size() >= 8) {
+                    ++rescueTemplateAttempts;
+                    float rescueScore = 0.0f;
+                    float rescueModule = 0.0f;
+                    std::string rescueDigits;
+                    extractProfile(y + static_cast<size_t>(yy) * rowStride, width, 1,
+                                   rescueProfile);
+                    if (decodeProfileByTemplates(rescueProfile.data(),
+                                                 static_cast<int>(rescueProfile.size()),
+                                                 options, mode, rescueDigits,
+                                                 rescueModule, rescueScore) &&
+                        !isUniform(rescueDigits)) {
+                        bool merged = false;
+                        for (auto& vote : beamVotes) {
+                            if (vote.first == rescueDigits) {
+                                vote.second += 1;
+                                merged = true;
+                                break;
+                            }
+                        }
+                        if (!merged) {
+                            beamVotes.push_back({rescueDigits, 1});
+                        }
+                    }
                 }
                 if (lineRuns.size() < 30) {
                     continue;
@@ -1546,8 +1573,7 @@ Result decodeYPlane(const uint8_t* y, int width, int height, int rowStride,
             if (info.status != ChecksumStatus::Valid) {
                 continue;
             }
-            const bool acceptable = vote.second >= 2 ||
-                (vote.second >= 1 && info.strength >= 2);
+            const bool acceptable = vote.second >= 2;
             if (acceptable && (vote.second > bestVotes ||
                 (vote.second == bestVotes && vote.first.size() > bestText.size()))) {
                 bestText = vote.first;
